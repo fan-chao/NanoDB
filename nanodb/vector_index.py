@@ -10,14 +10,14 @@ import numpy as np
 import ctypes as C
 
 from faiss_lite import (
-    cudaKNN, 
-    cudaL2Norm, 
-    DistanceMetrics, 
+    cudaKNN,
+    cudaL2Norm,
+    DistanceMetrics,
 )
 
 from cuda.cudart import (
-    cudaStreamCreateWithFlags, 
-    cudaStreamNonBlocking, 
+    cudaStreamCreateWithFlags,
+    cudaStreamNonBlocking,
     cudaStreamSynchronize,
 )
 
@@ -27,19 +27,20 @@ from nanodb.utils import AttributeDict, cudaAllocMapped, assert_cuda, convert_dt
 class cudaVectorIndex:
     """
     Flat vector store that uses FAISS CUDA kernels for KNN similarity search on embeddings.
-    
+
       * uses zero-copy shared CUDA memory mapped to PyTorch/numpy
       * supports float16 and float32 vectors
       * returned distances are float32, indexes are int64
-      
+
     It's aimed at storing high-dimensional embeddings, with a fixed reserve allocation due to their size.
     """
-    def __init__(self, dim, dtype=np.float32, reserve=1<<30, metric='cosine', max_search_queries=1, **kwargs):
+
+    def __init__(self, dim, dtype=np.float32, reserve=1 << 30, metric='cosine', max_search_queries=1, **kwargs):
         """
         Allocate memory for a vector index.
-        
+
         Parameters:
-        
+
           dim (int) -- dimension of the vectors (i.e. the size of the embedding)
           dtype (np.dtype|str) -- data type of the vectors, either float32 or float16
           reserve (int) -- maximum amount of memory (in bytes) to allocate for storing vectors (default 1GB)
@@ -48,10 +49,10 @@ class cudaVectorIndex:
         """
         self.shape = (0, dim)
         self.metric = metric
-        
+
         self.stats = AttributeDict()
         self.dtype = convert_dtype(dtype, to='np')
-        
+
         if isinstance(self.dtype, type):
             self.dsize = np.dtype(self.dtype).itemsize
         else:
@@ -60,32 +61,33 @@ class cudaVectorIndex:
         self.reserved_size = reserve
         self.reserved = int(self.reserved_size / (dim * self.dsize))
         self.max_search_queries = max_search_queries
-        
+
         err, self.stream = cudaStreamCreateWithFlags(cudaStreamNonBlocking)
         assert_cuda(err)
         self.torch_stream = torch.cuda.ExternalStream(int(self.stream), device='cuda:0')
-        #torch.cuda.set_stream(self.torch_stream)
-        
-        logging.info(f"nanodb creating CUDA vector index ({self.reserved},{dim}) dtype={dtype} metric={metric} stream={self.stream}")
-        
-        self.vectors = cudaAllocMapped((self.reserved, dim), self.dtype) # inputs
+        # torch.cuda.set_stream(self.torch_stream)
+
+        logging.info(
+            f"nanodb creating CUDA vector index ({self.reserved},{dim}) dtype={dtype} metric={metric} stream={self.stream}")
+
+        self.vectors = cudaAllocMapped((self.reserved, dim), self.dtype)  # inputs
         self.queries = cudaAllocMapped((max_search_queries, dim), self.dtype)
 
-        self.indexes = cudaAllocMapped((max_search_queries, self.reserved), np.int64) # outputs
+        self.indexes = cudaAllocMapped((max_search_queries, self.reserved), np.int64)  # outputs
         self.distances = cudaAllocMapped((max_search_queries, self.reserved), np.float32)
-        
+
         if metric == 'l2':
             self.vector_norms = cudaAllocMapped(self.reserved, np.float32)
-     
+
     def __len__(self):
         return self.shape[0]
-     
+
     def size(self):
         return self.shape[0] * self.shape[1] * self.dsize
-     
+
     def sync(self):
         assert_cuda(cudaStreamSynchronize(self.stream))
-        
+
     def add(self, vector, sync=True):
         """
         Add a vector and return its index.
@@ -93,7 +95,7 @@ class cudaVectorIndex:
         If sync=True, the CPU will wait for the CUDA stream to complete.
         """
         index = self.shape[0]
-        
+
         if isinstance(vector, np.ndarray):
             np.copyto(dst=self.vectors.array[index], src=vector, casting='no')
         elif isinstance(vector, torch.Tensor):
@@ -101,15 +103,15 @@ class cudaVectorIndex:
                 self.vectors.tensor[index] = vector
         else:
             raise ValueError(f"vector needs to be a np.ndarray or torch.Tensor (was type {type(vector)})")
-            
+
         if self.metric == 'l2':
-            assert(cudaL2Norm(
+            assert (cudaL2Norm(
                 C.cast(self.vectors.ptr + index * self.shape[1] * self.dsize, C.c_void_p),
                 self.dsize, 1, self.shape[1],
                 C.cast(self.vector_norms.ptr + index * 4, C.POINTER(C.c_float)),
                 True, C.c_void_p(int(self.stream)) if self.stream else None
             ))
-            
+
             if sync:
                 self.sync()
 
@@ -119,62 +121,62 @@ class cudaVectorIndex:
                     self.vectors.tensor[index], dim=-1,
                     out=self.vectors.tensor[index]
                 )
-            
+
             if sync:
                 self.sync()
-                
+
         self.shape = (index + 1, self.shape[1])
         return index
-        
+
     def search(self, queries, k=1, sync=True, return_tensors='np'):
         """
         Returns the indexes and distances of the k-closest vectors using the given distance metric.
         Each query should be of the same dimension and dtype that this class was created with.
-        
+
         Returns (indexes, distances) tuple where each of these has shape (queries, K)
         The returned distances are always with float32 dtype and the indexes are int64
         If return_tensors is 'np' ndarray's will be returned, or 'pt' for PyTorch tensors.
-        
+
         Note that for 'inner_product' and 'cosine' metrics, these are similarity metrics not
         distances, so they are in descending order (not ascending).  'cosine' is normalized
         between [0,1], where 1.0 is the highest probability of a match.
-        
+
         If sync=True, the CPU will wait for the CUDA stream to complete.  Otherwise, the function
         is aynchronous and None is returned.  In this case, cudaStreamSynchronize() should be called.
         """
         if isinstance(queries, list):
             queries = np.asarray(queries)
-        
+
         if len(queries.shape) == 1:
             queries.shape = (1, queries.shape[0])
-            
+
         if queries.shape[0] > self.max_search_queries:
             raise ValueError(f"the number of queries exceeds the max_search_queries of {self.max_search_queries}")
 
         if queries.shape[1] != self.shape[1]:
             raise ValueError(f"queries must match the vector dimension ({self.shape[1]})")
-        
+
         if queries.dtype != self.dtype and queries.dtype != convert_dtype(self.dtype, to='pt'):
             raise ValueError(f"queries need to use {self.dtype} dtype (was type {queries.dtype})")
-            
+
         if isinstance(queries, np.ndarray):
             np.copyto(dst=self.queries.array[:queries.shape[0]], src=queries, casting='no')
         elif isinstance(queries, torch.Tensor):
             with torch.cuda.StreamContext(self.torch_stream):
-                self.queries.tensor[:queries.shape[0]] = queries 
-           
+                self.queries.tensor[:queries.shape[0]] = queries
+
         time_begin = time.perf_counter()
-        
+
         if self.metric == 'cosine':
             with torch.cuda.StreamContext(self.torch_stream), torch.inference_mode():
                 torch.nn.functional.normalize(
                     self.queries.tensor[:queries.shape[0]], dim=-1,
                     out=self.queries.tensor[:queries.shape[0]]
                 )
-            
-        metric=self.metric if self.metric != 'cosine' else 'inner_product'
-        
-        assert(cudaKNN(
+
+        metric = self.metric if self.metric != 'cosine' else 'inner_product'
+
+        assert (cudaKNN(
             C.cast(self.vectors.ptr, C.c_void_p),
             C.cast(self.queries.ptr, C.c_void_p),
             self.dsize,
@@ -191,11 +193,11 @@ class cudaVectorIndex:
 
         if sync:
             self.sync()
-            
+
             self.stats.query_shape = queries.shape
             self.stats.index_shape = self.shape
             self.stats.search_time = time.perf_counter() - time_begin
-            
+
             if return_tensors == 'np':
                 return (
                     np.copy(self.indexes.array[:queries.shape[0], :k]).squeeze(),
@@ -204,19 +206,19 @@ class cudaVectorIndex:
         else:
             self.stats.search_time = time.perf_counter() - time_begin
             return None
-            
+
     def validate(self, k=4):
         """
         Sanity check search
         """
-        correct=True
-        metric=self.metric if self.metric != 'cosine' else 'inner_product'
+        correct = True
+        metric = self.metric if self.metric != 'cosine' else 'inner_product'
 
         for n in tqdm.tqdm(range(self.shape[0]), file=sys.stdout):
             with tqdm_redirect_stdout():
-                assert(cudaKNN(
+                assert (cudaKNN(
                     C.cast(self.vectors.ptr, C.c_void_p),
-                    C.cast(self.vectors.ptr+n*self.shape[1]*self.dsize, C.c_void_p),
+                    C.cast(self.vectors.ptr + n * self.shape[1] * self.dsize, C.c_void_p),
                     self.dsize,
                     self.shape[0],
                     1,
@@ -230,13 +232,14 @@ class cudaVectorIndex:
                 ))
                 self.sync()
                 if self.indexes.array[0][0] != n:
-                    logging.warning(f"incorrect or duplicate index [{n}]  indexes={self.indexes.array[0,:k]}  distances={self.distances.array[0,:k]}")
-                    #assert(self.indexes[0][0]==n)
-                    correct=False
-                
+                    logging.warning(
+                        f"incorrect or duplicate index [{n}]  indexes={self.indexes.array[0, :k]}  distances={self.distances.array[0, :k]}")
+                    # assert(self.indexes[0][0]==n)
+                    correct = False
+
         return correct
-        
-        
+
+
 '''
 # https://ai.stackexchange.com/questions/36191/how-to-calculate-a-meaningful-distance-between-multidimensional-tensors
 # https://ai.stackexchange.com/questions/37233/similarities-between-2d-vectors-to-flatten-or-to-not
@@ -266,7 +269,7 @@ def emd_2d(a, b):
     a = norm_2d(a)
     b = norm_2d(b)
     return torch.mean(torch.square(cumsum_2d(a) - cumsum_2d(b)), dim=(-1,-2))
-    
+
 cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
 
 et = torch.cat(embeddings)
@@ -274,26 +277,25 @@ print('et', et.shape, et.dtype, et.device)
 
 for n, embedding in enumerate(embeddings):
     print(n, embedding.shape, embedding.dtype, type(embedding))
-    
+
     distances = cos(embedding, et)
     """
     distances = torch.zeros((len(embeddings)), dtype=torch.float32, device='cuda:0')
-    
+
     print(f"distances:  {distances.shape}  {distances.dtype}")
-    
+
     for m, embedding2 in enumerate(embeddings):
         distances[m] = emd_2d(embedding, embedding2)
-        
+
     print(distances)
     """
-    
+
     indexes = torch.argsort(distances, descending=True).squeeze()
-    
+
     print(f"-- search results for {n} {metadata[n]}")
     for k in range(args.k):
         print(f"   * {indexes[k]} {metadata[indexes[k]]}  dist={distances[indexes[k]]}")
 '''
-
 
 """
 # pylibraft - https://github.com/rapidsai/raft/blob/4f0a2d2d6e30eea0c036ca3b531e03e44e760fbe/python/pylibraft/pylibraft/distance/pairwise_distance.pyx#L93
@@ -310,7 +312,7 @@ time_dist_end = time.perf_counter()
 
 if k == 1:
     topk = np.argmin(self.search_array, axis=1)
-    
+
 time_sort_end = time.perf_counter()
 
 print(f'dist: {(time_dist_end - time_dist_begin) * 1000:.3f} ms')

@@ -12,6 +12,7 @@ from .utils import LogFormatter
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+parser.add_argument("--model", type=str, default="openai/clip-vit-large-patch14-336", help="the name or path of the CLIP/SigLIP model to load")
 parser.add_argument("--path", type=str, default=None, help="path to load or create the database")
 parser.add_argument("--scan", action='append', nargs='*', help="a directory or file to extract embeddings from")
 parser.add_argument("--max-scan", type=int, default=None, help="the maximum number of items to scan (None for unlimited)")
@@ -52,7 +53,8 @@ print(args)
 np.random.seed(args.seed)
 
 db = NanoDB(
-    args.path,
+    model=args.model,
+    path=args.path,
     dtype=args.dtype, 
     reserve=args.reserve*1024*1024, 
     metric=args.metric, 
